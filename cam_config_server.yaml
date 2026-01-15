@@ -17,6 +17,12 @@ head_camera:
   # webrtc codec preference, options: "vp8", "h264"
   webrtc_codec: h264
 
+  # Depth stream configuration (RealSense cameras only)
+  # Set to true to enable depth stream
+  enable_depth: false
+  # Port to publish depth stream via ZMQ (must be different from zmq_port)
+  depth_zmq_port: 55558
+
   # Type of camera:
   #   - "opencv"    → opencv driver
   #   - "realsense" → pyrealsense2 driver
@@ -56,6 +62,9 @@ left_wrist_camera:
   enable_webrtc: true
   webrtc_port : 60002
   webrtc_codec: h264
+  # Depth stream configuration (RealSense cameras only)
+  enable_depth: false
+  depth_zmq_port: 55559
   type: uvc
   image_shape: [480, 640]
   binocular: false
@@ -73,6 +82,9 @@ right_wrist_camera:
   enable_webrtc: true
   webrtc_port: 60003
   webrtc_codec: h264
+  # Depth stream configuration (RealSense cameras only)
+  enable_depth: false
+  depth_zmq_port: 55560
   type: uvc
   image_shape: [480, 640]
   binocular: false

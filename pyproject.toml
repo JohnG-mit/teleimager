@@ -7,7 +7,7 @@ authors = [
 ]
 license = { file = "LICENSE" }
 readme = "README.md"
-requires-python = ">=3.8,<3.11"
+
 dependencies = [
     "logging_mp",
     "opencv-python",

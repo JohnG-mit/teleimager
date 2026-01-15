@@ -825,7 +825,8 @@ class CameraFinder:
 
 class BaseCamera:
     def __init__(self, cam_topic, img_shape, fps, 
-                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
+                 enable_depth=False, depth_zmq_port=None):
         self._ready = threading.Event()
         self._cam_topic = cam_topic
         self._img_shape = img_shape # (H, W)
@@ -844,6 +845,14 @@ class BaseCamera:
             self._webrtc_buffer = TripleRingBuffer()
         else:
             self._webrtc_buffer = None
+
+        # Depth stream support (RealSense only)
+        self._enable_depth = enable_depth
+        self._depth_zmq_port = depth_zmq_port
+        if self._enable_depth and self._depth_zmq_port:
+            self._depth_zmq_buffer = TripleRingBuffer()
+        else:
+            self._depth_zmq_buffer = None
 
     def __str__(self):
         raise NotImplementedError
@@ -878,6 +887,19 @@ class BaseCamera:
            Before call this function, must first call get_frame() to update the latest depth data."""
         return None
 
+    def get_depth_bytes(self):
+        """Return depth data as bytes from the buffer."""
+        depth_bytes = self._depth_zmq_buffer.read() if self._enable_depth and self._depth_zmq_buffer else None
+        return depth_bytes
+
+    def enable_depth_zmq(self):
+        """Return whether depth ZMQ publishing is enabled."""
+        return self._enable_depth and self._depth_zmq_port is not None
+
+    def get_depth_zmq_port(self):
+        """Return the depth ZMQ port number."""
+        return self._depth_zmq_port
+
     def get_zmq_port(self):
         """Return the zmq port number the camera is serving on."""
         return self._zmq_port
@@ -900,11 +922,12 @@ class BaseCamera:
 
 class RealSenseCamera(BaseCamera):
     def __init__(self, cam_topic, serial_number, img_shape, fps, 
-                 enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, enable_depth=False):
+                 enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, 
+                 enable_depth=False, depth_zmq_port=None):
         rs = self.check_pyrealsense2_install()
-        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                         enable_depth, depth_zmq_port)
         self._serial_number = serial_number
-        self._enable_depth = enable_depth
         self._latest_depth = None
         try:
             align_to = rs.stream.color
@@ -960,22 +983,36 @@ class RealSenseCamera(BaseCamera):
         if not color_frame:
             return None
 
+        bgr_numpy = np.asanyarray(color_frame.get_data())
+        rgb_jpeg_bytes = None
+        
+        if self._enable_zmq or (self._enable_depth and self._depth_zmq_buffer is not None):
+            ok, buf = cv2.imencode(".jpg", bgr_numpy)
+            if ok:
+                rgb_jpeg_bytes = buf.tobytes()
+
         if self._enable_depth:   
             depth_frame = aligned_frames.get_depth_frame()
             if depth_frame:
                 self._latest_depth = np.asanyarray(depth_frame.get_data())
+                # Pack RGB and Depth together to ensure frame alignment
+                # Protocol: [4 bytes: rgb_len][rgb_jpeg_data][depth_png_data]
+                if self._depth_zmq_buffer is not None and rgb_jpeg_bytes is not None:
+                    ok, depth_buf = cv2.imencode(".png", self._latest_depth)
+                    if ok:
+                        depth_png_bytes = depth_buf.tobytes()
+                        rgb_len = len(rgb_jpeg_bytes)
+                        # Pack: 4-byte header (rgb length) + rgb data + depth data
+                        packed_data = rgb_len.to_bytes(4, 'little') + rgb_jpeg_bytes + depth_png_bytes
+                        self._depth_zmq_buffer.write(packed_data)
             else:
                 self._latest_depth = None
-
-        bgr_numpy = np.asanyarray(color_frame.get_data())
 
         if self._enable_webrtc:
             self._webrtc_buffer.write(bgr_numpy)
 
-        if self._enable_zmq:
-            ok, buf = cv2.imencode(".jpg", bgr_numpy)
-            if ok:
-                self._zmq_buffer.write(buf.tobytes())
+        if self._enable_zmq and rgb_jpeg_bytes is not None:
+            self._zmq_buffer.write(rgb_jpeg_bytes)
         
         if not self._ready.is_set():
             self._ready.set()
@@ -1200,7 +1237,7 @@ class IsaacSimCamera(BaseCamera):
 # image server
 # ========================================================
 class ImageServer:
-    def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False):
+    def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False, depth_enable=False):
         self._cam_config = cam_config
         self._realsense_enable = realsense_enable
         self._isaacsim_enable = isaacsim_enable
@@ -1273,8 +1310,11 @@ class ImageServer:
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
                     else:
+                        enable_depth = cam_cfg.get("enable_depth", False) or depth_enable
+                        depth_zmq_port = cam_cfg.get("depth_zmq_port", None)
                         self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
-                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec, 
+                                                                   enable_depth, depth_zmq_port)
 
                 elif cam_type == "uvc":
                     uid = None
@@ -1399,6 +1439,28 @@ class ImageServer:
             logger_mp.error(f"[Image Server] Failed to publish rtc frame from {cam_topic} camera.")
             self._stop_event.set()
 
+    def _depth_zmq_pub(self, cam_topic: str, camera: BaseCamera):
+        """Publish depth frames via ZMQ for RealSense cameras."""
+        try:
+            interval = 1.0 / camera.get_fps()
+            next_frame_time = time.monotonic()
+
+            while not self._stop_event.is_set():
+                depth_bytes = camera.get_depth_bytes()
+                if depth_bytes is not None:
+                    self._zmq_publisher_manager.publish(depth_bytes, camera.get_depth_zmq_port())
+                # Note: depth may be None if no depth frame available yet, don't treat as error
+
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+        except Exception as e:
+            logger_mp.error(f"[Image Server] Failed to publish depth zmq frame from {cam_topic} camera: {e}")
+            self._stop_event.set()
+
     def _clean_up(self):
         self._responser.stop()
         for t in self._publisher_threads:
@@ -1462,6 +1524,13 @@ class ImageServer:
                 t = threading.Thread(target=self._zmq_pub, args=(camera_topic, camera), daemon=True)
                 t.start()
                 self._publisher_threads.append(t)
+
+            # Start depth ZMQ publisher thread if enabled
+            if camera.enable_depth_zmq():
+                t = threading.Thread(target=self._depth_zmq_pub, args=(camera_topic, camera), daemon=True)
+                t.start()
+                self._publisher_threads.append(t)
+                logger_mp.info(f"[Image Server] Started depth ZMQ publisher for {camera_topic} on port {camera.get_depth_zmq_port()}")
 
     def wait(self):
         self._stop_event.wait()

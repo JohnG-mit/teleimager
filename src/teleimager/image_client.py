@@ -272,13 +272,17 @@ class ZMQ_SubscriberThread(threading.Thread):
         self._fps_count = 0
         self._fps_interval = 8  # update fps every 8 frames
 
-    def _decode_image(self, jpg_bytes):
-        """Decode JPEG bytes to OpenCV image."""
-        if jpg_bytes is None:
+    def _decode_image(self, img_bytes):
+        """Decode image bytes (JPEG or PNG) to OpenCV image.
+        
+        Supports both JPEG (RGB) and PNG (depth 16-bit) formats.
+        """
+        if img_bytes is None:
             return None
         try:
-            np_img = np.frombuffer(jpg_bytes, dtype=np.uint8)
-            return cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+            np_img = np.frombuffer(img_bytes, dtype=np.uint8)
+            # Use IMREAD_UNCHANGED to preserve 16-bit depth images
+            return cv2.imdecode(np_img, cv2.IMREAD_UNCHANGED)
         except Exception as e:
             logger_mp.warning(f"[ZMQ_SubscriberThread] Failed to decode image: {e}")
             return None
@@ -307,11 +311,22 @@ class ZMQ_SubscriberThread(threading.Thread):
         """Get the current image receiving FPS."""
         return self._image_fps
 
-    def recv(self) -> Optional[bytes]:
-        """Get the latest received message.
+    def recv(self) -> Optional[np.ndarray]:
+        """Get the latest received message as decoded image.
 
         Returns:
             The latest message as an OpenCV image, or None if no message has been received.
+        """
+        raw_data = self._triple_ring_buffer.read()
+        if raw_data is None:
+            return None
+        return self._decode_image(raw_data)
+
+    def recv_raw(self) -> Optional[bytes]:
+        """Get the latest received message as raw bytes (without decoding).
+
+        Returns:
+            The latest message as raw bytes, or None if no message has been received.
         """
         return self._triple_ring_buffer.read()
 
@@ -421,6 +436,55 @@ class ZMQ_SubscriberManager:
 
         subscriber_thread = self._get_subscriber_thread(host, port)
         return subscriber_thread.recv(), subscriber_thread.get_fps()
+
+    def subscribe_rgbd(self, host: str, port: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float]:
+        """Receive the latest aligned RGB-D message from the specified subscriber.
+        
+        The packed data format: [4 bytes: rgb_len][rgb_jpeg_data][depth_png_data]
+        
+        Args:
+            host: The server address
+            port: The port number
+
+        Returns:
+            rgb_img: The RGB image as BGR OpenCV image, or None if not available.
+            depth_img: The depth image as 16-bit single channel numpy array, or None if not available.
+            fps: The current receiving frame per second (FPS).
+        """
+        if not self._running:
+            raise RuntimeError("SubscriberManager is closed.")
+
+        subscriber_thread = self._get_subscriber_thread(host, port)
+        packed_data = subscriber_thread.recv_raw()
+        fps = subscriber_thread.get_fps()
+        
+        if packed_data is None or len(packed_data) < 4:
+            return None, None, fps
+        
+        try:
+            # Unpack: first 4 bytes are rgb length (little-endian)
+            rgb_len = int.from_bytes(packed_data[:4], 'little')
+            
+            if len(packed_data) < 4 + rgb_len:
+                logger_mp.warning("[ZMQ_SubscriberManager] Invalid RGBD packet: insufficient data")
+                return None, None, fps
+            
+            # Extract RGB and depth data
+            rgb_jpeg_bytes = packed_data[4:4 + rgb_len]
+            depth_png_bytes = packed_data[4 + rgb_len:]
+            
+            # Decode RGB (JPEG)
+            rgb_np = np.frombuffer(rgb_jpeg_bytes, dtype=np.uint8)
+            rgb_img = cv2.imdecode(rgb_np, cv2.IMREAD_COLOR)
+            
+            # Decode Depth (PNG, 16-bit)
+            depth_np = np.frombuffer(depth_png_bytes, dtype=np.uint8)
+            depth_img = cv2.imdecode(depth_np, cv2.IMREAD_UNCHANGED)
+            
+            return rgb_img, depth_img, fps
+        except Exception as e:
+            logger_mp.warning(f"[ZMQ_SubscriberManager] Failed to unpack RGBD data: {e}")
+            return None, None, fps
 
     def close(self) -> None:
         """Close all subscribers."""
@@ -590,12 +654,21 @@ class ImageClient:
         
         if self._cam_config['head_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'])
+            # Subscribe to depth stream if enabled
+            if self._cam_config['head_camera'].get('enable_depth', False) and self._cam_config['head_camera'].get('depth_zmq_port'):
+                self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['depth_zmq_port'])
 
         if self._cam_config['left_wrist_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'])
+            # Subscribe to depth stream if enabled
+            if self._cam_config['left_wrist_camera'].get('enable_depth', False) and self._cam_config['left_wrist_camera'].get('depth_zmq_port'):
+                self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['depth_zmq_port'])
 
         if self._cam_config['right_wrist_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'])
+            # Subscribe to depth stream if enabled
+            if self._cam_config['right_wrist_camera'].get('enable_depth', False) and self._cam_config['right_wrist_camera'].get('depth_zmq_port'):
+                self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['depth_zmq_port'])
 
         if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
             logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
@@ -609,11 +682,65 @@ class ImageClient:
     def get_head_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'])
     
+    def get_head_depth_frame(self):
+        """Get aligned RGB and depth frame from head camera (RealSense only).
+        
+        The RGB and depth are captured and aligned in the same frame on server side,
+        ensuring temporal synchronization.
+        
+        Returns:
+            Tuple[Optional[np.ndarray], Optional[np.ndarray], float]: (rgb_image, depth_image, fps)
+            rgb_image is a BGR OpenCV image, depth_image is a 16-bit single channel numpy array.
+            Returns (None, None, 0.0) if depth is not enabled or not available.
+        """
+        if not self._cam_config['head_camera'].get('enable_depth', False):
+            return None, None, 0.0
+        depth_port = self._cam_config['head_camera'].get('depth_zmq_port')
+        if depth_port is None:
+            return None, None, 0.0
+        return self._subscriber_manager.subscribe_rgbd(self._host, depth_port)
+    
     def get_left_wrist_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'])
     
+    def get_left_wrist_depth_frame(self):
+        """Get aligned RGB and depth frame from left wrist camera (RealSense only).
+        
+        The RGB and depth are captured and aligned in the same frame on server side,
+        ensuring temporal synchronization.
+        
+        Returns:
+            Tuple[Optional[np.ndarray], Optional[np.ndarray], float]: (rgb_image, depth_image, fps)
+            rgb_image is a BGR OpenCV image, depth_image is a 16-bit single channel numpy array.
+            Returns (None, None, 0.0) if depth is not enabled or not available.
+        """
+        if not self._cam_config['left_wrist_camera'].get('enable_depth', False):
+            return None, None, 0.0
+        depth_port = self._cam_config['left_wrist_camera'].get('depth_zmq_port')
+        if depth_port is None:
+            return None, None, 0.0
+        return self._subscriber_manager.subscribe_rgbd(self._host, depth_port)
+    
     def get_right_wrist_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'])
+    
+    def get_right_wrist_depth_frame(self):
+        """Get aligned RGB and depth frame from right wrist camera (RealSense only).
+        
+        The RGB and depth are captured and aligned in the same frame on server side,
+        ensuring temporal synchronization.
+        
+        Returns:
+            Tuple[Optional[np.ndarray], Optional[np.ndarray], float]: (rgb_image, depth_image, fps)
+            rgb_image is a BGR OpenCV image, depth_image is a 16-bit single channel numpy array.
+            Returns (None, None, 0.0) if depth is not enabled or not available.
+        """
+        if not self._cam_config['right_wrist_camera'].get('enable_depth', False):
+            return None, None, 0.0
+        depth_port = self._cam_config['right_wrist_camera'].get('depth_zmq_port')
+        if depth_port is None:
+            return None, None, 0.0
+        return self._subscriber_manager.subscribe_rgbd(self._host, depth_port)
         
     def close(self):
         self._subscriber_manager.close()
