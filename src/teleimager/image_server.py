@@ -964,7 +964,8 @@ class RealSenseCamera(BaseCamera):
             f"[RealSenseCamera: {self._cam_topic}] initialized with "
             f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
             f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
-            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}; "
+            f"Depth: {'enabled, depth_zmq_port=' + str(self._depth_zmq_port) if self._enable_depth else 'disabled'}"
         )
 
     def check_pyrealsense2_install(self):
@@ -1237,7 +1238,7 @@ class IsaacSimCamera(BaseCamera):
 # image server
 # ========================================================
 class ImageServer:
-    def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False, depth_enable=False):
+    def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False):
         self._cam_config = cam_config
         self._realsense_enable = realsense_enable
         self._isaacsim_enable = isaacsim_enable
@@ -1310,7 +1311,7 @@ class ImageServer:
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
                     else:
-                        enable_depth = cam_cfg.get("enable_depth", False) or depth_enable
+                        enable_depth = cam_cfg.get("enable_depth", False)
                         depth_zmq_port = cam_cfg.get("depth_zmq_port", None)
                         self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec, 

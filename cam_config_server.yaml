@@ -19,7 +19,7 @@ head_camera:
 
   # Depth stream configuration (RealSense cameras only)
   # Set to true to enable depth stream
-  enable_depth: false
+  enable_depth: true
   # Port to publish depth stream via ZMQ (must be different from zmq_port)
   depth_zmq_port: 55558
 
@@ -27,14 +27,14 @@ head_camera:
   #   - "opencv"    → opencv driver
   #   - "realsense" → pyrealsense2 driver
   #   - "uvc"       → pyuvc driver
-  type: uvc
+  type: realsense
 
   # Image Format
   # image resolution: [height, width]
-  image_shape: [480, 1280]
+  image_shape: [480, 640]
   binocular: true
   # frame per second
-  fps: 30
+  fps: 60
 
   # Camera identifiers (choose one or more):
   #   - video_id: X        → /dev/videoX  (e.g. 0 → /dev/video0)
@@ -50,16 +50,16 @@ head_camera:
   #   - type "opencv":    supports video_id, serial_number, physical_path
   #   - type "uvc":       supports video_id, serial_number, physical_path
   video_id: 0
-  serial_number: 01.00.00
+  serial_number: 344422070919
   physical_path: null
 
 # =====================================================
 # Left wrist camera configuration
 # =====================================================
 left_wrist_camera:
-  enable_zmq: true
+  enable_zmq: false
   zmq_port : 55556
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port : 60002
   webrtc_codec: h264
   # Depth stream configuration (RealSense cameras only)
@@ -77,9 +77,9 @@ left_wrist_camera:
 # Right wrist camera configuration
 # =====================================================
 right_wrist_camera:
-  enable_zmq: true
+  enable_zmq: false
   zmq_port : 55557
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port: 60003
   webrtc_codec: h264
   # Depth stream configuration (RealSense cameras only)
