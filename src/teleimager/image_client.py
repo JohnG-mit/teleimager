@@ -251,12 +251,13 @@ class ZMQ_PublisherManager:
 class ZMQ_SubscriberThread(threading.Thread):
     """Thread that owns a SUB socket and handles receiving the latest message."""
 
-    def __init__(self, host: str, port: int, context: Optional[zmq.Context] = None):
+    def __init__(self, host: str, port: int, context: Optional[zmq.Context] = None, raw_mode: bool = False):
         """Initialize subscriber thread.
 
         Args:
             port: The port number to connect to.
             host: The server host address to connect to.
+            raw_mode: If True, store raw bytes in buffer without decoding (for RGBD data)
         """
         super().__init__(daemon=True)
         self._host = host
@@ -264,6 +265,7 @@ class ZMQ_SubscriberThread(threading.Thread):
         self._context = context
         self._socket = None
         self._running = True
+        self._raw_mode = raw_mode  # Store raw bytes instead of decoded images
         self._triple_ring_buffer = TripleRingBuffer()
         self._started = threading.Event()
         # for fps calculation
@@ -358,9 +360,15 @@ class ZMQ_SubscriberThread(threading.Thread):
                     try:
                         # receive the latest message
                         img_bytes = self._socket.recv()
-                        img_numpy = self._decode_image(img_bytes)  # decode JPEG bytes to bgr image
-                        self._update_fps()                         # update fps
-                        self._triple_ring_buffer.write(img_numpy)  # write to 3-ring-buffer
+                        self._update_fps()  # update fps
+                        
+                        if self._raw_mode:
+                            # For RGBD data: store raw bytes without decoding
+                            self._triple_ring_buffer.write(img_bytes)
+                        else:
+                            # For regular images: decode and store
+                            img_numpy = self._decode_image(img_bytes)
+                            self._triple_ring_buffer.write(img_numpy)
                     except Exception as e:
                         if self._running:
                             logger_mp.error(f"Error in subscriber loop: {e}")
@@ -390,9 +398,9 @@ class ZMQ_SubscriberManager:
     def __init__(self):
         self._context = zmq.Context()
 
-    def _create_subscriber_thread(self, host: str, port: int) -> ZMQ_SubscriberThread:
+    def _create_subscriber_thread(self, host: str, port: int, raw_mode: bool = False) -> ZMQ_SubscriberThread:
         try:
-            subscriber_thread = ZMQ_SubscriberThread(host, port, self._context)
+            subscriber_thread = ZMQ_SubscriberThread(host, port, self._context, raw_mode=raw_mode)
             subscriber_thread.start()
             # Wait for the thread to start and socket to be ready
             if not subscriber_thread._wait_for_start(timeout=1.0):
@@ -402,11 +410,11 @@ class ZMQ_SubscriberManager:
             logger_mp.error(f"Failed to create subscriber thread for {host}:{port}: {e}")
             raise 
 
-    def _get_subscriber_thread(self, host: str, port: int) -> ZMQ_SubscriberThread:
+    def _get_subscriber_thread(self, host: str, port: int, raw_mode: bool = False) -> ZMQ_SubscriberThread:
         key = (host, port)
         with self._lock:
             if key not in self._subscriber_threads:
-                self._subscriber_threads[key] = self._create_subscriber_thread(host, port)
+                self._subscriber_threads[key] = self._create_subscriber_thread(host, port, raw_mode=raw_mode)
             return self._subscriber_threads[key]
         
     # --------------------------------------------------------
@@ -454,7 +462,7 @@ class ZMQ_SubscriberManager:
         if not self._running:
             raise RuntimeError("SubscriberManager is closed.")
 
-        subscriber_thread = self._get_subscriber_thread(host, port)
+        subscriber_thread = self._get_subscriber_thread(host, port, raw_mode=True)
         packed_data = subscriber_thread.recv_raw()
         fps = subscriber_thread.get_fps()
         
@@ -652,24 +660,32 @@ class ImageClient:
         if self._cam_config is None:
             raise RuntimeError("Failed to get camera configuration.")
         
+        logger_mp.debug("[Image Client] Starting ZMQ subscribers...")
         if self._cam_config['head_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'])
-            # Subscribe to depth stream if enabled
-            if self._cam_config['head_camera'].get('enable_depth', False) and self._cam_config['head_camera'].get('depth_zmq_port'):
-                self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['depth_zmq_port'])
+            try:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'])
+                logger_mp.debug(f"[Image Client] Subscribed to head camera on port {self._cam_config['head_camera']['zmq_port']}")
+            except Exception as e:
+                logger_mp.warning(f"[Image Client] Failed to subscribe to head camera: {e}")
+            # Note: Depth streams use raw_mode and will be subscribed on first access via subscribe_rgbd()
 
         if self._cam_config['left_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'])
-            # Subscribe to depth stream if enabled
-            if self._cam_config['left_wrist_camera'].get('enable_depth', False) and self._cam_config['left_wrist_camera'].get('depth_zmq_port'):
-                self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['depth_zmq_port'])
+            try:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'])
+                logger_mp.debug(f"[Image Client] Subscribed to left wrist camera on port {self._cam_config['left_wrist_camera']['zmq_port']}")
+            except Exception as e:
+                logger_mp.warning(f"[Image Client] Failed to subscribe to left wrist camera: {e}")
+            # Note: Depth streams use raw_mode and will be subscribed on first access via subscribe_rgbd()
 
         if self._cam_config['right_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'])
-            # Subscribe to depth stream if enabled
-            if self._cam_config['right_wrist_camera'].get('enable_depth', False) and self._cam_config['right_wrist_camera'].get('depth_zmq_port'):
-                self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['depth_zmq_port'])
+            try:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'])
+                logger_mp.debug(f"[Image Client] Subscribed to right wrist camera on port {self._cam_config['right_wrist_camera']['zmq_port']}")
+            except Exception as e:
+                logger_mp.warning(f"[Image Client] Failed to subscribe to right wrist camera: {e}")
+            # Note: Depth streams use raw_mode and will be subscribed on first access via subscribe_rgbd()
 
+        logger_mp.debug("[Image Client] All ZMQ subscribers initialized.")
         if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
             logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
 
@@ -751,35 +767,94 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', type=str, default='192.168.123.164', help='IP address of image server')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
 
+    # Set log level
+    if args.debug:
+        logger_mp.setLevel(logging_mp.DEBUG)
+
     # Example usage with three camera streams
-    client = ImageClient(host=args.host)
+    try:
+        client = ImageClient(host=args.host)
+    except Exception as e:
+        logger_mp.error(f"[Image Client] Failed to initialize client: {e}")
+        return
+    
     cam_config = client.get_cam_config()
 
+    logger_mp.info("[Image Client] Connected to server. Waiting for first frames from server...")
+    logger_mp.info("[Image Client] Press 'q' to quit.")
+    logger_mp.info(f"[Image Client] Cameras enabled:")
+    if cam_config['head_camera']['enable_zmq']:
+        depth_str = " (with depth)" if cam_config['head_camera'].get('enable_depth', False) else ""
+        logger_mp.info(f"  - head_camera on port {cam_config['head_camera']['zmq_port']}{depth_str}")
+    if cam_config['left_wrist_camera']['enable_zmq']:
+        logger_mp.info(f"  - left_wrist_camera on port {cam_config['left_wrist_camera']['zmq_port']}")
+    if cam_config['right_wrist_camera']['enable_zmq']:
+        logger_mp.info(f"  - right_wrist_camera on port {cam_config['right_wrist_camera']['zmq_port']}")
+
     running = True
+    frame_count = 0
+    first_frame_logged = False
+    no_frame_count = 0
+    
     while running:
+        has_frame = False
+        
         if cam_config['head_camera']['enable_zmq']:
-            head_img, head_fps = client.get_head_frame()
-            if head_img is not None:
-                logger_mp.info(f"Head Camera FPS: {head_fps:.2f}")
-                logger_mp.debug(f"Head Camera Shape: {cam_config['head_camera']['image_shape']}")
-                logger_mp.debug(f"Head Camera Binocular: {cam_config['head_camera']['binocular']}")
-                cv2.imshow("Head Camera", head_img)
+            if cam_config['head_camera'].get('enable_depth', False):
+                head_img, head_depth, head_fps = client.get_head_depth_frame()
+                if head_img is not None and head_depth is not None:
+                    has_frame = True
+                    if not first_frame_logged:
+                        logger_mp.info("[Image Client] Receiving head camera frames!")
+                        first_frame_logged = True
+                        no_frame_count = 0
+                    logger_mp.debug(f"Head Camera FPS: {head_fps:.2f}")
+                    cv2.imshow("Head Camera RGB", head_img)
+                    # Normalize depth for visualization
+                    depth_vis = cv2.convertScaleAbs(head_depth, alpha=0.03)
+                    cv2.imshow("Head Camera Depth", depth_vis)
+            else:
+                head_img, head_fps = client.get_head_frame()
+                if head_img is not None:
+                    has_frame = True
+                    if not first_frame_logged:
+                        logger_mp.info("[Image Client] Receiving head camera frames!")
+                        first_frame_logged = True
+                        no_frame_count = 0
+                    logger_mp.debug(f"Head Camera FPS: {head_fps:.2f}")
+                    cv2.imshow("Head Camera", head_img)
 
         if cam_config['left_wrist_camera']['enable_zmq']:
             left_wrist_img, left_wrist_fps = client.get_left_wrist_frame()
             if left_wrist_img is not None:
-                logger_mp.info(f"Left Wrist Camera FPS: {left_wrist_fps:.2f}")
-                logger_mp.debug(f"Left Wrist Camera Shape: {cam_config['left_wrist_camera']['image_shape']}")
+                has_frame = True
+                logger_mp.debug(f"Left Wrist Camera FPS: {left_wrist_fps:.2f}")
                 cv2.imshow("Left Wrist Camera", left_wrist_img)
 
         if cam_config['right_wrist_camera']['enable_zmq']:
             right_wrist_img, right_wrist_fps = client.get_right_wrist_frame()
             if right_wrist_img is not None:
-                logger_mp.info(f"Right Wrist Camera FPS: {right_wrist_fps:.2f}")
-                logger_mp.debug(f"Right Wrist Camera Shape: {cam_config['right_wrist_camera']['image_shape']}")
+                has_frame = True
+                logger_mp.debug(f"Right Wrist Camera FPS: {right_wrist_fps:.2f}")
                 cv2.imshow("Right Wrist Camera", right_wrist_img)
+
+        # Log progress if no frames yet
+        if not has_frame:
+            no_frame_count += 1
+            if no_frame_count == 500:
+                logger_mp.warning("[Image Client] Still waiting for frames (500 iterations)...")
+                logger_mp.warning("[Image Client] Please check:")
+                logger_mp.warning("  1. Server is running: python -m teleimager.image_server")
+                logger_mp.warning("  2. Network connectivity to server")
+                logger_mp.warning("  3. Cameras are properly connected to server")
+            elif no_frame_count % 1000 == 0:
+                logger_mp.info(f"[Image Client] Still waiting... ({no_frame_count} iterations)")
+        else:
+            frame_count += 1
+            no_frame_count = 0  # Reset counter when we get frames
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             logger_mp.info("Exiting image client on user request.")
