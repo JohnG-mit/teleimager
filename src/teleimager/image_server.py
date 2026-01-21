@@ -1172,7 +1172,7 @@ class IsaacSimCamera(BaseCamera):
             binocular: if True and image_source=="head", concatenate left+right for binocular vision
         """
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
-        from tools.shared_memory_utils import MultiImageReader # https://github.com/unitreerobotics/unitree_sim_isaaclab/tree/main/tools
+        from teleimager.tools.shared_memory_utils import MultiImageReader
         self.multi_image_reader = MultiImageReader()
         self._image_source = image_source  # "head", "left", or "right"
         self._binocular = binocular
