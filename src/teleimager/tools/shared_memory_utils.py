@@ -616,3 +616,31 @@ class SharedMemoryReader:
     
     def close(self):
         self.multi_reader.close() 
+
+if __name__ == "__main__":
+    shm_writer = SharedMemoryWriter()
+    shm_reader = SharedMemoryReader()
+
+    while True:
+        try:
+            shm_writer.write_rgbd_pair(
+                rgb_image=np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8),
+                depth_image=np.random.randint(0, 5000, (480, 640), dtype=np.uint16),
+                depth_encoding="png"
+            )
+            img_dic = shm_reader.read_rgbd_pair()
+            if img_dic is None:
+                print("No RGB-D pair read")
+                time.sleep(0.1)
+                continue
+            rgb_img = img_dic['rgb']
+            depth_img = img_dic['depth']
+            if rgb_img is not None and depth_img is not None:
+                print(f"Read RGB image shape: {rgb_img.shape}, Depth image shape: {depth_img.shape}")
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            # must close shared memory to avoid resource leak
+            shm_writer.close()
+            shm_reader.close()
+            break
+    
