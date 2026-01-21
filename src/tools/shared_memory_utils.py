@@ -16,12 +16,20 @@ import struct
 import os
 
 # shared memory configuration
-# Use separate shared memory for each image
-def get_shm_name(image_name: str) -> str:
-    """Get shared memory name for a specific image"""
-    return f"isaac_{image_name}_image_shm"
+# Use separate shared memory for each image/depth stream
+def get_shm_name(image_name: str, stream: str = "image") -> str:
+    """Get shared memory name for a specific image stream.
+
+    Args:
+        image_name: image key name (e.g., 'head', 'left', 'right')
+        stream: 'image' for RGB, 'depth' for depth
+    """
+    if stream == "image":
+        return f"isaac_{image_name}_image_shm"
+    return f"isaac_{image_name}_{stream}_shm"
 
 SHM_SIZE_PER_IMAGE = 640 * 480 * 3 + 128  # ~1MB per image + header + buffer
+SHM_SIZE_PER_DEPTH = 640 * 480 * 2 + 128  # ~0.6MB per depth + header + buffer
 
 # Backward compatibility
 SHM_NAME = "isaac_multi_image_shm"  # Kept for backward compatibility
@@ -45,7 +53,12 @@ class SimpleImageHeader(ctypes.LittleEndianStructure):  # Use little-endian for 
 class MultiImageWriter:
     """A simplified multi-image shared memory writer using separate SHM for each image"""
 
-    def __init__(self, enable_jpeg: bool = False, jpeg_quality: int = 85, skip_cvtcolor: bool = False):
+    def __init__(
+            self, 
+            enable_jpeg: bool = False, 
+            jpeg_quality: int = 85, 
+            skip_cvtcolor: bool = False
+        ):
         """Initialize the multi-image shared memory writer
 
         Args:
@@ -74,6 +87,30 @@ class MultiImageWriter:
         if skip_cvtcolor is not None:
             self._skip_cvtcolor = bool(skip_cvtcolor)
 
+    def _get_or_create_shm(self, image_name: str, *, stream: str, shm_size: int) -> shared_memory.SharedMemory:
+        shm_name = get_shm_name(image_name, stream=stream)
+        if shm_name not in self.shms:
+            try:
+                self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+            except FileNotFoundError:
+                self.shms[shm_name] = shared_memory.SharedMemory(create=True, size=shm_size, name=shm_name)
+        return self.shms[shm_name]
+
+    def _write_buffer(self, *, shm: shared_memory.SharedMemory, header: "SimpleImageHeader", data_bytes: bytes) -> bool:
+        header.data_size = len(data_bytes)
+        header_size = ctypes.sizeof(SimpleImageHeader)
+        total_size = header_size + header.data_size
+        if total_size > shm.size:
+            print(f"[MultiImageWriter] Not enough space for {header.image_name.decode('utf-8').rstrip(chr(0))}: need {total_size}, available {shm.size}")
+            return False
+
+        header_bytes = ctypes.string_at(ctypes.byref(header), header_size)
+        shm.buf[0:header_size] = header_bytes
+        data_start = header_size
+        data_end = data_start + header.data_size
+        shm.buf[data_start:data_end] = data_bytes
+        return True
+
     def write_images(self, images: Dict[str, np.ndarray]) -> bool:
         """Write multiple images to separate shared memories
 
@@ -95,17 +132,7 @@ class MultiImageWriter:
 
         for image_name, image in images.items():
             try:
-                # 为每个图像获取独立的共享内存
-                shm_name = get_shm_name(image_name)
-                if shm_name not in self.shms:
-                    try:
-                        # 尝试打开现有的共享内存
-                        self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
-                    except FileNotFoundError:
-                        # 如果不存在，创建新的共享内存
-                        self.shms[shm_name] = shared_memory.SharedMemory(create=True, size=SHM_SIZE_PER_IMAGE, name=shm_name)
-
-                shm = self.shms[shm_name]
+                shm = self._get_or_create_shm(image_name, stream="image", shm_size=SHM_SIZE_PER_IMAGE)
 
                 # 确保连续内存布局，尽量减少拷贝
                 if not image.flags['C_CONTIGUOUS']:
@@ -141,25 +168,8 @@ class MultiImageWriter:
                     header.encoding = 0
                     header.quality = 0
 
-                header.data_size = len(data_bytes)
-
-                # 检查空间是否足够
-                header_size = ctypes.sizeof(SimpleImageHeader)
-                total_size = header_size + header.data_size
-                if total_size > shm.size:
-                    print(f"[MultiImageWriter] Not enough space for {image_name}: need {total_size}, available {shm.size}")
-                    continue
-
-                # 写入头部
-                header_bytes = ctypes.string_at(ctypes.byref(header), header_size)
-                shm.buf[0:header_size] = header_bytes
-
-                # 写入数据
-                data_start = header_size
-                data_end = data_start + header.data_size
-                shm.buf[data_start:data_end] = data_bytes
-
-                success_count += 1
+                if self._write_buffer(shm=shm, header=header, data_bytes=data_bytes):
+                    success_count += 1
 
             except Exception as e:
                 print(f"[MultiImageWriter] Error writing {image_name}: {e}")
@@ -167,6 +177,102 @@ class MultiImageWriter:
 
         self._last_write_ts_ms = now_ms
         return success_count > 0
+
+    def write_rgbd_pair(
+        self,
+        image_name: str,
+        rgb_image: np.ndarray,
+        depth_image: np.ndarray,
+        *,
+        depth_encoding: str = "png"
+    ) -> bool:
+        """Write an RGB + depth pair into separate shared memories with the same timestamp.
+
+        Args:
+            image_name: image key (e.g., 'head')
+            rgb_image: BGR/RGB image
+            depth_image: depth image (uint16)
+            depth_encoding: 'png' or 'raw16'
+        """
+        if rgb_image is None or depth_image is None:
+            return False
+
+        now_ms = int(time.time() * 1000)
+
+        rgb_ok = False
+        depth_ok = False
+
+        try:
+            # RGB write
+            rgb_shm = self._get_or_create_shm(image_name, stream="image", shm_size=SHM_SIZE_PER_IMAGE)
+
+            if not rgb_image.flags['C_CONTIGUOUS']:
+                rgb_image = np.ascontiguousarray(rgb_image)
+            if rgb_image.ndim == 3 and rgb_image.shape[2] == 3:
+                if not self._skip_cvtcolor:
+                    rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+
+            height, width, channels = rgb_image.shape
+            rgb_header = SimpleImageHeader()
+            rgb_header.timestamp = now_ms
+            rgb_header.height = height
+            rgb_header.width = width
+            rgb_header.channels = channels
+            rgb_header.image_name = image_name.encode('utf-8')[:15].ljust(16, b'\x00')
+
+            if self._enable_jpeg:
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(self._jpeg_quality)]
+                ok, buffer = cv2.imencode('.jpg', rgb_image, encode_params)
+                if ok:
+                    rgb_data = buffer.tobytes()
+                    rgb_header.encoding = 1
+                    rgb_header.quality = int(self._jpeg_quality)
+                else:
+                    rgb_data = rgb_image.tobytes()
+                    rgb_header.encoding = 0
+                    rgb_header.quality = 0
+            else:
+                rgb_data = rgb_image.tobytes()
+                rgb_header.encoding = 0
+                rgb_header.quality = 0
+
+            rgb_ok = self._write_buffer(shm=rgb_shm, header=rgb_header, data_bytes=rgb_data)
+        except Exception as e:
+            print(f"[MultiImageWriter] Error writing RGB {image_name}: {e}")
+
+        try:
+            # Depth write
+            depth_shm = self._get_or_create_shm(image_name, stream="depth", shm_size=SHM_SIZE_PER_DEPTH)
+
+            if not depth_image.flags['C_CONTIGUOUS']:
+                depth_image = np.ascontiguousarray(depth_image)
+
+            depth_header = SimpleImageHeader()
+            depth_header.timestamp = now_ms
+            depth_header.height = depth_image.shape[0]
+            depth_header.width = depth_image.shape[1]
+            depth_header.channels = 1 if depth_image.ndim == 2 else depth_image.shape[2]
+            depth_header.image_name = image_name.encode('utf-8')[:15].ljust(16, b'\x00')
+
+            if depth_encoding == "png":
+                ok, buffer = cv2.imencode('.png', depth_image)
+                if not ok:
+                    raise RuntimeError("depth png encode failed")
+                depth_data = buffer.tobytes()
+                depth_header.encoding = 2  # PNG depth
+                depth_header.quality = 0
+            elif depth_encoding == "raw16":
+                depth_data = depth_image.tobytes()
+                depth_header.encoding = 3  # RAW16 depth
+                depth_header.quality = 0
+            else:
+                raise ValueError(f"Unsupported depth_encoding: {depth_encoding}")
+
+            depth_ok = self._write_buffer(shm=depth_shm, header=depth_header, data_bytes=depth_data)
+        except Exception as e:
+            print(f"[MultiImageWriter] Error writing depth {image_name}: {e}")
+
+        return rgb_ok and depth_ok
 
     def close(self):
         """Close all shared memories"""
@@ -185,7 +291,9 @@ class MultiImageReader:
     def __init__(self):
         """Initialize the multi-image shared memory reader"""
         self.last_timestamps = {}  # image_name -> last_timestamp
+        self.last_rgbd_timestamps = {}  # image_name -> last_rgbd_timestamp
         self.buffer = {}  # image_name -> cached_image
+        self.depth_buffer = {}  # image_name -> cached_depth
         self.shms = {}  # image_name -> SharedMemory
 
     def read_images(self) -> Optional[Dict[str, np.ndarray]]:
@@ -199,7 +307,7 @@ class MultiImageReader:
 
         for image_name in image_names:
             try:
-                shm_name = get_shm_name(image_name)
+                shm_name = get_shm_name(image_name, stream="image")
 
                 # Open shared memory if not already open
                 if shm_name not in self.shms:
@@ -349,41 +457,114 @@ class MultiImageReader:
 
     def read_encoded_frame(self, image_name: str = "head") -> Optional[bytes]:
         """Read encoded payload for a specific image if available (e.g., JPEG). Returns bytes or None."""
-        if self.shm is None:
-            return None
+        shm_name = get_shm_name(image_name, stream="image")
+        if shm_name not in self.shms:
+            try:
+                self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+            except FileNotFoundError:
+                return None
+
+        shm = self.shms[shm_name]
 
         try:
-            # Scan through all images in shared memory
             header_size = ctypes.sizeof(SimpleImageHeader)
-            current_offset = 0
+            header_data = bytes(shm.buf[:header_size])
+            header = SimpleImageHeader.from_buffer_copy(header_data)
 
-            while current_offset < self.shm.size - header_size:
-                # Read header
-                header_data = bytes(self.shm.buf[current_offset:current_offset + header_size])
-                header = SimpleImageHeader.from_buffer_copy(header_data)
+            if header.encoding != 1:
+                return None
 
-                # Check if this is the image we want and it's encoded
-                current_image_name = header.image_name.decode('utf-8').rstrip('\x00')
-                if current_image_name == image_name and header.encoding == 1:
-                    # Check if there is new data
-                    if header.timestamp <= self.last_timestamp:
-                        return None
+            last_ts = self.last_timestamps.get(image_name, 0)
+            if header.timestamp <= last_ts:
+                return None
 
-                    # Read the payload
-                    data_start = current_offset + header_size
-                    data_end = data_start + header.data_size
-                    payload = bytes(self.shm.buf[data_start:data_end])
+            data_start = header_size
+            data_end = data_start + header.data_size
+            payload = bytes(shm.buf[data_start:data_end])
 
-                    self.last_timestamp = header.timestamp
-                    return payload
-
-                # Move to next image
-                current_offset += header_size + header.data_size
-
-            return None
+            self.last_timestamps[image_name] = header.timestamp
+            return payload
 
         except Exception as e:
             print(f"[MultiImageReader] Error reading encoded frame for {image_name}: {e}")
+            return None
+
+    def read_rgbd_pair(self, image_name: str = "head") -> Optional[Dict[str, np.ndarray]]:
+        """Read an RGB + depth pair that share the same timestamp.
+
+        Returns:
+            Dict with keys: 'rgb', 'depth' or None if not available.
+        """
+        rgb_shm_name = get_shm_name(image_name, stream="image")
+        depth_shm_name = get_shm_name(image_name, stream="depth")
+
+        try:
+            if rgb_shm_name not in self.shms:
+                self.shms[rgb_shm_name] = shared_memory.SharedMemory(name=rgb_shm_name)
+            if depth_shm_name not in self.shms:
+                self.shms[depth_shm_name] = shared_memory.SharedMemory(name=depth_shm_name)
+        except FileNotFoundError:
+            return None
+
+        rgb_shm = self.shms[rgb_shm_name]
+        depth_shm = self.shms[depth_shm_name]
+
+        try:
+            header_size = ctypes.sizeof(SimpleImageHeader)
+            rgb_header = SimpleImageHeader.from_buffer_copy(bytes(rgb_shm.buf[:header_size]))
+            depth_header = SimpleImageHeader.from_buffer_copy(bytes(depth_shm.buf[:header_size]))
+
+            # Require matching timestamps for a valid pair
+            if rgb_header.timestamp == 0 or depth_header.timestamp == 0:
+                return None
+            if rgb_header.timestamp != depth_header.timestamp:
+                return None
+
+            last_pair_ts = self.last_rgbd_timestamps.get(image_name, 0)
+            if rgb_header.timestamp <= last_pair_ts:
+                if image_name in self.buffer and image_name in self.depth_buffer:
+                    return {"rgb": self.buffer[image_name], "depth": self.depth_buffer[image_name]}
+                return None
+
+            # Read RGB
+            rgb_payload = bytes(rgb_shm.buf[header_size:header_size + rgb_header.data_size])
+            if rgb_header.encoding == 1:
+                rgb_encoded = np.frombuffer(rgb_payload, dtype=np.uint8)
+                rgb_img = cv2.imdecode(rgb_encoded, cv2.IMREAD_COLOR)
+            else:
+                rgb_img = np.frombuffer(rgb_payload, dtype=np.uint8)
+                expected_size = rgb_header.height * rgb_header.width * rgb_header.channels
+                if rgb_img.size != expected_size:
+                    return None
+                rgb_img = rgb_img.reshape(rgb_header.height, rgb_header.width, rgb_header.channels)
+
+            if rgb_img is None:
+                return None
+
+            # Read depth
+            depth_payload = bytes(depth_shm.buf[header_size:header_size + depth_header.data_size])
+            if depth_header.encoding == 2:
+                depth_encoded = np.frombuffer(depth_payload, dtype=np.uint8)
+                depth_img = cv2.imdecode(depth_encoded, cv2.IMREAD_UNCHANGED)
+            elif depth_header.encoding == 3:
+                depth_img = np.frombuffer(depth_payload, dtype=np.uint16)
+                expected_size = depth_header.height * depth_header.width
+                if depth_img.size != expected_size:
+                    return None
+                depth_img = depth_img.reshape(depth_header.height, depth_header.width)
+            else:
+                return None
+
+            if depth_img is None:
+                return None
+
+            self.buffer[image_name] = rgb_img
+            self.depth_buffer[image_name] = depth_img
+            self.last_rgbd_timestamps[image_name] = rgb_header.timestamp
+            return {"rgb": rgb_img, "depth": depth_img}
+
+        except Exception as e:
+            print(f"[MultiImageReader] Error reading RGBD pair for {image_name}: {e}")
             return None
 
     def close(self):
@@ -404,11 +585,15 @@ class SharedMemoryWriter:
     """Backward compatible single image writer"""
     
     def __init__(self, shm_name: str = SHM_NAME, shm_size: int = SHM_SIZE):
-        self.multi_writer = MultiImageWriter(shm_name, shm_size)
+        self.multi_writer = MultiImageWriter()
     
     def write_image(self, image: np.ndarray) -> bool:
         """Write a single image (as the head image)"""
         return self.multi_writer.write_images({'head': image})
+    
+    def write_rgbd_pair(self, rgb_image: np.ndarray, depth_image: np.ndarray, *, depth_encoding: str = "png") -> bool:
+        """Write a single RGB-D pair (as the head image)"""
+        return self.multi_writer.write_rgbd_pair('head', rgb_image, depth_image, depth_encoding=depth_encoding)
     
     def close(self):
         self.multi_writer.close()
@@ -418,12 +603,16 @@ class SharedMemoryReader:
     """Backward compatible single image reader"""
     
     def __init__(self, shm_name: str = SHM_NAME):
-        self.multi_reader = MultiImageReader(shm_name)
+        self.multi_reader = MultiImageReader()
     
     def read_image(self) -> Optional[np.ndarray]:
         """Read a single image (the head image)"""
         images = self.multi_reader.read_images()
         return images.get('head') if images else None
+    
+    def read_rgbd_pair(self) -> Optional[Dict[str, np.ndarray]]:
+        """Read a single RGB-D pair (the head image)"""
+        return self.multi_reader.read_rgbd_pair('head')
     
     def close(self):
         self.multi_reader.close() 
