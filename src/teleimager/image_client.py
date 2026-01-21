@@ -355,11 +355,12 @@ class ZMQ_SubscriberThread(threading.Thread):
             # Signal that socket is ready
             self._started.set()
             while self._running:
-                events = dict(poller.poll(timeout=100))
+                # Use shorter timeout for higher frame rates
+                events = dict(poller.poll(timeout=15))
                 if self._socket in events:
                     try:
-                        # receive the latest message
-                        img_bytes = self._socket.recv()
+                        # receive the latest message (non-blocking since we already polled)
+                        img_bytes = self._socket.recv(zmq.NOBLOCK)
                         self._update_fps()  # update fps
                         
                         if self._raw_mode:
@@ -373,9 +374,6 @@ class ZMQ_SubscriberThread(threading.Thread):
                         if self._running:
                             logger_mp.error(f"Error in subscriber loop: {e}")
                         break
-                else:
-                    self._triple_ring_buffer.write(None)
-                    logger_mp.debug(f"No message received from {self._host}:{self._port} within timeout.")
         except Exception as e:
             logger_mp.error(f"Failed to initialize subscriber socket: {e}")
         finally:
@@ -768,6 +766,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', type=str, default='192.168.123.164', help='IP address of image server')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--profile', action='store_true', help='Enable performance profiling')
+    parser.add_argument('--headless', action='store_true', help='Run in headless mode (no display, only get RGBD frames and report FPS)')
     args = parser.parse_args()
 
     # Set log level
@@ -784,7 +784,11 @@ def main():
     cam_config = client.get_cam_config()
 
     logger_mp.info("[Image Client] Connected to server. Waiting for first frames from server...")
-    logger_mp.info("[Image Client] Press 'q' to quit.")
+    if args.headless:
+        logger_mp.info("[Image Client] Running in HEADLESS mode - no display windows")
+        logger_mp.info("[Image Client] Press Ctrl+C to quit.")
+    else:
+        logger_mp.info("[Image Client] Press 'q' to quit.")
     logger_mp.info(f"[Image Client] Cameras enabled:")
     if cam_config['head_camera']['enable_zmq']:
         depth_str = " (with depth)" if cam_config['head_camera'].get('enable_depth', False) else ""
@@ -799,32 +803,101 @@ def main():
     first_frame_logged = False
     no_frame_count = 0
     
+    # Performance profiling
+    if args.profile:
+        import collections
+        timing_stats = collections.defaultdict(list)
+        last_profile_time = time.time()
+    
+    # Headless mode: simple FPS tracking
+    if args.headless:
+        headless_frame_count = 0
+        headless_start_time = time.time()
+        headless_last_report = time.time()
+    
+    # Headless mode: simplified loop for RGBD capture only
+    if args.headless:
+        logger_mp.info("[Image Client] Starting headless RGBD capture loop...")
+        try:
+            while running:
+                head_img, head_depth, head_fps = client.get_head_depth_frame()
+                
+                if head_img is not None and head_depth is not None:
+                    if not first_frame_logged:
+                        logger_mp.info("[Image Client] ✓ Receiving RGBD frames!")
+                        first_frame_logged = True
+                    
+                    headless_frame_count += 1
+                    no_frame_count = 0
+                    
+                    # Report FPS every 2 seconds
+                    now = time.time()
+                    if now - headless_last_report >= 2.0:
+                        elapsed = now - headless_start_time
+                        avg_fps = headless_frame_count / elapsed if elapsed > 0 else 0
+                        logger_mp.info(f"[Headless] Frames: {headless_frame_count}, "
+                                      f"Avg FPS: {avg_fps:.2f}, "
+                                      f"Server FPS: {head_fps:.2f}, "
+                                      f"RGB shape: {head_img.shape}, "
+                                      f"Depth shape: {head_depth.shape}")
+                        headless_last_report = now
+                else:
+                    no_frame_count += 1
+                    if no_frame_count == 500:
+                        logger_mp.warning("[Image Client] Still waiting for RGBD frames (500 iterations)...")
+                    elif no_frame_count % 1000 == 0:
+                        logger_mp.debug(f"[Image Client] Still waiting... ({no_frame_count} iterations)")
+                
+                # Small sleep to avoid busy loop
+                time.sleep(0.001)
+        except KeyboardInterrupt:
+            logger_mp.info("[Image Client] Interrupted by user.")
+        finally:
+            client.close()
+            logger_mp.info(f"[Headless] Total frames received: {headless_frame_count}")
+            elapsed = time.time() - headless_start_time
+            if elapsed > 0:
+                logger_mp.info(f"[Headless] Average FPS: {headless_frame_count / elapsed:.2f}")
+        return
+    
+    # Normal display mode
     while running:
+        loop_start = time.time() if args.profile else None
         has_frame = False
         
         if cam_config['head_camera']['enable_zmq']:
             if cam_config['head_camera'].get('enable_depth', False):
+                t0 = time.time() if args.profile else None
                 head_img, head_depth, head_fps = client.get_head_depth_frame()
+                if args.profile and t0:
+                    timing_stats['rgbd_decode'].append(time.time() - t0)
+                    
                 if head_img is not None and head_depth is not None:
                     has_frame = True
                     if not first_frame_logged:
-                        logger_mp.info("[Image Client] Receiving head camera frames!")
+                        logger_mp.info("[Image Client] ✓ Receiving head camera frames!")
                         first_frame_logged = True
                         no_frame_count = 0
-                    logger_mp.debug(f"Head Camera FPS: {head_fps:.2f}")
+                    if frame_count % 30 == 0:  # Log every 30 frames
+                        logger_mp.info(f"Head Camera FPS: {head_fps:.2f}")
+                    
+                    t0 = time.time() if args.profile else None
                     cv2.imshow("Head Camera RGB", head_img)
                     # Normalize depth for visualization
                     depth_vis = cv2.convertScaleAbs(head_depth, alpha=0.03)
                     cv2.imshow("Head Camera Depth", depth_vis)
+                    if args.profile and t0:
+                        timing_stats['imshow'].append(time.time() - t0)
             else:
                 head_img, head_fps = client.get_head_frame()
                 if head_img is not None:
                     has_frame = True
                     if not first_frame_logged:
-                        logger_mp.info("[Image Client] Receiving head camera frames!")
+                        logger_mp.info("[Image Client] ✓ Receiving head camera frames!")
                         first_frame_logged = True
                         no_frame_count = 0
-                    logger_mp.debug(f"Head Camera FPS: {head_fps:.2f}")
+                    if frame_count % 30 == 0:
+                        logger_mp.info(f"Head Camera FPS: {head_fps:.2f}")
                     cv2.imshow("Head Camera", head_img)
 
         if cam_config['left_wrist_camera']['enable_zmq']:
@@ -851,19 +924,39 @@ def main():
                 logger_mp.warning("  2. Network connectivity to server")
                 logger_mp.warning("  3. Cameras are properly connected to server")
             elif no_frame_count % 1000 == 0:
-                logger_mp.info(f"[Image Client] Still waiting... ({no_frame_count} iterations)")
+                logger_mp.debug(f"[Image Client] Still waiting... ({no_frame_count} iterations)")
         else:
             frame_count += 1
             no_frame_count = 0  # Reset counter when we get frames
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # cv2.waitKey is needed to update windows and also serves as frame limiter
+        # waitKey(1) = 1ms delay, allows up to ~1000fps (actual will be limited by processing)
+        t0 = time.time() if args.profile else None
+        key = cv2.waitKey(1) & 0xFF
+        if args.profile and t0:
+            timing_stats['waitKey'].append(time.time() - t0)
+            
+        if key == ord('q'):
             logger_mp.info("Exiting image client on user request.")
             running = False
             # clean up
             client.close()
             cv2.destroyAllWindows()
-        # Small delay to prevent excessive CPU usage
-        time.sleep(0.002)
+        # No additional sleep needed - waitKey(1) already provides minimal delay
+        
+        # Profile report every 5 seconds
+        if args.profile and loop_start:
+            timing_stats['loop_total'].append(time.time() - loop_start)
+            if time.time() - last_profile_time > 5.0:
+                logger_mp.info(f"\n{'='*60}")
+                logger_mp.info("Performance Profile (last 5s):")
+                for key, times in timing_stats.items():
+                    if times:
+                        avg = sum(times) / len(times) * 1000
+                        logger_mp.info(f"  {key:15s}: {avg:6.2f}ms avg ({len(times)} samples)")
+                logger_mp.info(f"{'='*60}\n")
+                timing_stats.clear()
+                last_profile_time = time.time()
 
 if __name__ == "__main__":
     main()
