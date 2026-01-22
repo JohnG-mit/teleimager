@@ -10,7 +10,7 @@ import ctypes
 import time
 import numpy as np
 import cv2
-from multiprocessing import shared_memory
+from multiprocessing.shared_memory import SharedMemory
 from typing import Optional, Dict, List
 import struct
 import os
@@ -87,16 +87,16 @@ class MultiImageWriter:
         if skip_cvtcolor is not None:
             self._skip_cvtcolor = bool(skip_cvtcolor)
 
-    def _get_or_create_shm(self, image_name: str, *, stream: str, shm_size: int) -> shared_memory.SharedMemory:
+    def _get_or_create_shm(self, image_name: str, *, stream: str, shm_size: int) -> SharedMemory:
         shm_name = get_shm_name(image_name, stream=stream)
         if shm_name not in self.shms:
             try:
-                self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+                self.shms[shm_name] = SharedMemory(name=shm_name)
             except FileNotFoundError:
-                self.shms[shm_name] = shared_memory.SharedMemory(create=True, size=shm_size, name=shm_name)
+                self.shms[shm_name] = SharedMemory(create=True, size=shm_size, name=shm_name)
         return self.shms[shm_name]
 
-    def _write_buffer(self, *, shm: shared_memory.SharedMemory, header: "SimpleImageHeader", data_bytes: bytes) -> bool:
+    def _write_buffer(self, *, shm: SharedMemory, header: "SimpleImageHeader", data_bytes: bytes) -> bool:
         header.data_size = len(data_bytes)
         header_size = ctypes.sizeof(SimpleImageHeader)
         total_size = header_size + header.data_size
@@ -313,7 +313,7 @@ class MultiImageReader:
                 # Open shared memory if not already open
                 if shm_name not in self.shms:
                     try:
-                        self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+                        self.shms[shm_name] = SharedMemory(name=shm_name)
                     except FileNotFoundError:
                         continue  # Skip if shared memory doesn't exist
 
@@ -410,7 +410,7 @@ class MultiImageReader:
             # Open shared memory if not already open
             if shm_name not in self.shms:
                 try:
-                    self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+                    self.shms[shm_name] = SharedMemory(name=shm_name)
                 except FileNotFoundError:
                     print(f"[MultiImageReader] Shared memory {shm_name} not found")
                     return None
@@ -461,7 +461,7 @@ class MultiImageReader:
         shm_name = get_shm_name(image_name, stream="image")
         if shm_name not in self.shms:
             try:
-                self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+                self.shms[shm_name] = SharedMemory(name=shm_name)
             except FileNotFoundError:
                 return None
 
@@ -501,9 +501,9 @@ class MultiImageReader:
 
         try:
             if rgb_shm_name not in self.shms:
-                self.shms[rgb_shm_name] = shared_memory.SharedMemory(name=rgb_shm_name)
+                self.shms[rgb_shm_name] = SharedMemory(name=rgb_shm_name)
             if depth_shm_name not in self.shms:
-                self.shms[depth_shm_name] = shared_memory.SharedMemory(name=depth_shm_name)
+                self.shms[depth_shm_name] = SharedMemory(name=depth_shm_name)
         except FileNotFoundError:
             return None
 
