@@ -279,6 +279,7 @@ class MultiImageWriter:
         for shm_name, shm in self.shms.items():
             try:
                 shm.close()
+                shm.unlink()
                 print(f"[MultiImageWriter] Shared memory closed: {shm_name}")
             except Exception as e:
                 print(f"[MultiImageWriter] Error closing {shm_name}: {e}")
